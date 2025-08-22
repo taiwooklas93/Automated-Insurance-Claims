@@ -368,35 +368,7 @@
   )
 )
 
-;; Submit oracle data (only registered oracles)
-(define-public (submit-oracle-data
-  (oracle-id (string-ascii 36))
-  (weather-type uint)
-  (location (string-utf8 100))
-  (value uint)
-)
-  (let
-    (
-      (oracle-info (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
-    )
-    ;; Verify oracle is active and caller is authorized
-    (asserts! (get is-active oracle-info) (err ERR-ORACLE-NOT-REGISTERED))
-    (asserts! (is-eq tx-sender (get oracle-principal oracle-info)) (err ERR-NOT-AUTHORIZED))
-    
-    ;; Store oracle data
-    (map-set oracle-data
-      { oracle-id: oracle-id, data-block: block-height }
-      {
-        weather-type: weather-type,
-        location: location,
-        value: value,
-        timestamp: block-height
-      }
-    )
-    
-    (ok true)
-  )
-)
+
 
 ;; =============================================================================
 ;; PUBLIC FUNCTIONS - Risk Profile Management
@@ -461,3 +433,165 @@
     new-count
   )
 )
+;; Submit oracle data
+(define-public (submit-oracle-data
+ (oracle-id (string-ascii 36))
+ (weather-type uint)
+ (location (string-utf8 100))
+ (value uint)
+ (timestamp uint)
+)
+ (let
+   (
+     (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+   )
+  
+   ;; Only the registered oracle principal can submit data
+   (asserts! (is-eq tx-sender (get oracle-principal oracle)) (err ERR-NOT-AUTHORIZED))
+  
+   ;; Ensure oracle is active
+   (asserts! (get is-active oracle) (err ERR-ORACLE-NOT-REGISTERED))
+  
+   ;; Store oracle data
+   (map-set oracle-data
+     { oracle-id: oracle-id, data-block: block-height }
+     {
+       weather-type: weather-type,
+       location: location,
+       value: value,
+       timestamp: timestamp
+     }
+   )
+  
+   (ok true)
+ )
+)
+
+;; Create a new insurance policy
+(define-public (create-policy
+ (risk-profile-id uint)
+ (coverage-amount uint)
+ (duration-blocks uint)
+ (auto-renew bool)
+ (location (string-utf8 100))
+)
+ (let
+  (
+     (policy-id (var-get next-policy-id))
+     (risk-profile (unwrap! (get-risk-profile risk-profile-id) (err ERR-INVALID-RISK-PROFILE)))
+     (premium-result (unwrap! (calculate-premium risk-profile-id coverage-amount location) (err ERR-INVALID-PARAMETERS)))
+   )
+  
+   ;; Validate coverage amount
+   (asserts! (and
+              (>= coverage-amount (get min-coverage risk-profile))
+              (<= coverage-amount (get max-coverage risk-profile))
+             )
+             (err ERR-INVALID-COVERAGE-AMOUNT))
+  
+   ;; Collect premium payment
+   (try! (stx-transfer? premium-result tx-sender (as-contract tx-sender)))
+  
+   ;; Update treasury
+   (var-set treasury-balance (+ (var-get treasury-balance) premium-result))
+   (var-set total-premiums-collected (+ (var-get total-premiums-collected) premium-result))
+  
+   ;; Create policy
+   (map-set policies
+     { policy-id: policy-id }
+     {
+       policyholder: tx-sender,
+       risk-profile-id: risk-profile-id,
+       coverage-amount: coverage-amount,
+       premium-amount: premium-result,
+       start-block: block-height,
+       end-block: (+ block-height duration-blocks),
+       policy-status: POLICY-STATUS-ACTIVE,
+       renewal-count: u0,
+       auto-renew: auto-renew,
+       location: location,
+       created-at: block-height,
+       last-updated: block-height
+     }
+   )
+  
+   ;; Update user policy tracking
+   (match (map-get? user-policy-count { user: tx-sender })
+     existing-count
+     (let
+       (
+         (new-count (+ (get count existing-count) u1))
+       )
+       (map-set user-policy-count
+         { user: tx-sender }
+         { count: new-count }
+       )
+       (map-set user-policies
+         { user: tx-sender, index: (- new-count u1) }
+         { policy-id: policy-id }
+       )
+     )
+     (begin
+       (map-set user-policy-count
+         { user: tx-sender }
+         { count: u1 }
+       )
+       (map-set user-policies
+         { user: tx-sender, index: u0 }
+         { policy-id: policy-id }
+       )
+     )
+   )
+  
+   ;; Increment policy ID counter
+   (var-set next-policy-id (+ policy-id u1))
+  
+   (ok policy-id)
+ )
+)
+
+
+;; Add a condition to policy
+(define-public (add-policy-condition
+ (policy-id uint)
+ (weather-type uint)
+ (operator uint)
+ (threshold-value uint)
+ (payout-percentage uint)
+(oracle-id (string-ascii 36))
+)
+ (let
+   (
+     (policy (unwrap! (get-policy policy-id) (err ERR-POLICY-NOT-FOUND)))
+     (condition-index u0) ;; For simplicity, we only allow one condition per policy
+   )
+  
+   ;; Check if caller is policy holder
+   (asserts! (is-eq tx-sender (get policyholder policy)) (err ERR-NOT-AUTHORIZED))
+  
+   ;; Check if policy is active
+   (asserts! (is-eq (get policy-status policy) POLICY-STATUS-ACTIVE) (err ERR-POLICY-NOT-ACTIVE))
+  
+   ;; Check if oracle exists
+   (asserts! (is-some (get-oracle oracle-id)) (err ERR-ORACLE-NOT-REGISTERED))
+  
+   ;; Validate payout percentage (max 100%)
+   (asserts! (<= payout-percentage u10000) (err ERR-INVALID-PARAMETERS))
+  
+   ;; Add condition
+   (map-set policy-conditions
+     { policy-id: policy-id, condition-index: condition-index }
+     {
+       weather-type: weather-type,
+       operator: operator,
+       threshold-value: threshold-value,
+       payout-percentage: payout-percentage,
+       oracle-id: oracle-id
+     }
+   )
+  
+   (ok true)
+ )
+)
+
+
