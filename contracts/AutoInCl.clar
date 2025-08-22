@@ -24,6 +24,7 @@
 (define-constant ERR-NOT-CLAIMABLE-YET u15)
 (define-constant ERR-PAYMENT-FAILED u16)
 (define-constant ERR-POLICY-NOT-EXPIRED u17)
+(define-constant ERR-CONTRACT-PAUSED u18)
 
 ;; =============================================================================
 ;; STATUS CONSTANTS
@@ -66,6 +67,7 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var total-premiums-collected uint u0)
 (define-data-var total-claims-paid uint u0)
+(define-data-var contract-paused bool false)
 
 ;; =============================================================================
 ;; DATA MAPS
@@ -481,6 +483,9 @@
      (risk-profile (unwrap! (get-risk-profile risk-profile-id) (err ERR-INVALID-RISK-PROFILE)))
      (premium-result (unwrap! (calculate-premium risk-profile-id coverage-amount location) (err ERR-INVALID-PARAMETERS)))
    )
+
+   ;; Check if contract is paused
+   (asserts! (not (var-get contract-paused)) (err ERR-CONTRACT-PAUSED))
   
    ;; Validate coverage amount
    (asserts! (and
@@ -594,4 +599,536 @@
  )
 )
 
+;; =============================================================================
+;; PUBLIC FUNCTIONS - Claim Processing
+;; =============================================================================
 
+;; Submit a claim for a policy
+(define-public (submit-claim
+  (policy-id uint)
+  (weather-event-type uint)
+  (weather-event-value uint)
+  (oracle-data-block uint)
+)
+  (let
+    (
+      (policy (unwrap! (get-policy policy-id) (err ERR-POLICY-NOT-FOUND)))
+      (claim-id (var-get next-claim-id))
+      (condition (unwrap! (get-policy-condition policy-id u0) (err ERR-INVALID-PARAMETERS)))
+    )
+
+    ;; Check if contract is paused
+    (asserts! (not (var-get contract-paused)) (err ERR-CONTRACT-PAUSED))
+
+    ;; Verify caller is the policyholder
+    (asserts! (is-eq tx-sender (get policyholder policy)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Verify policy is active
+    (asserts! (is-policy-active policy-id) (err ERR-POLICY-NOT-ACTIVE))
+
+    ;; Verify no existing claim for this policy
+    (asserts! (is-none (map-get? policy-claims { policy-id: policy-id, claim-index: u0 }))
+              (err ERR-ALREADY-CLAIMED))
+
+    ;; Verify weather event matches policy condition
+    (asserts! (is-eq weather-event-type (get weather-type condition)) (err ERR-CLAIM-CONDITION-NOT-MET))
+
+    ;; Get oracle data for verification
+    (let
+      (
+        (oracle-id (get oracle-id condition))
+        (oracle-data-entry (unwrap! (get-oracle-data oracle-id oracle-data-block) (err ERR-NO-ORACLE-DATA)))
+      )
+
+      ;; Verify oracle data matches claim
+      (asserts! (is-eq (get weather-type oracle-data-entry) weather-event-type) (err ERR-INVALID-ORACLE-DATA))
+      (asserts! (is-eq (get value oracle-data-entry) weather-event-value) (err ERR-INVALID-ORACLE-DATA))
+
+      ;; Calculate claim amount based on condition
+      (let
+        (
+          (coverage-amount (get coverage-amount policy))
+          (payout-percentage (get payout-percentage condition))
+          (claim-amount (/ (* coverage-amount payout-percentage) u10000))
+        )
+
+        ;; Create the claim
+        (map-set claims
+          { claim-id: claim-id }
+          {
+            policy-id: policy-id,
+            claimant: tx-sender,
+            claim-status: CLAIM-STATUS-PENDING,
+            claim-amount: claim-amount,
+            weather-event-type: weather-event-type,
+            weather-event-value: weather-event-value,
+            condition-index: u0,
+            submitted-block: block-height,
+            processed-block: none,
+            paid-block: none,
+            oracle-data-block: oracle-data-block
+          }
+        )
+
+        ;; Link claim to policy
+        (map-set policy-claims
+          { policy-id: policy-id, claim-index: u0 }
+          { claim-id: claim-id }
+        )
+
+        ;; Increment claim ID counter
+        (var-set next-claim-id (+ claim-id u1))
+
+        (ok claim-id)
+      )
+    )
+  )
+)
+
+;; Process a pending claim (automated evaluation)
+(define-public (process-claim (claim-id uint))
+  (let
+    (
+      (claim (unwrap! (get-claim claim-id) (err ERR-CLAIM-NOT-FOUND)))
+      (policy-id (get policy-id claim))
+      (policy (unwrap! (get-policy policy-id) (err ERR-POLICY-NOT-FOUND)))
+      (condition (unwrap! (get-policy-condition policy-id (get condition-index claim)) (err ERR-INVALID-PARAMETERS)))
+    )
+
+    ;; Verify claim is pending
+    (asserts! (is-eq (get claim-status claim) CLAIM-STATUS-PENDING) (err ERR-INVALID-PARAMETERS))
+
+    ;; Get oracle data for evaluation
+    (let
+      (
+        (oracle-id (get oracle-id condition))
+        (oracle-data-block (get oracle-data-block claim))
+        (oracle-data-entry (unwrap! (get-oracle-data oracle-id oracle-data-block) (err ERR-NO-ORACLE-DATA)))
+        (threshold (get threshold-value condition))
+        (operator (get operator condition))
+        (actual-value (get weather-event-value claim))
+      )
+
+      ;; Evaluate if claim conditions are met
+      (if (evaluate-condition operator actual-value threshold)
+        ;; Approve and pay claim
+        (begin
+          (let ((claim-amount (get claim-amount claim)))
+            ;; Verify treasury has sufficient funds
+            (asserts! (>= (var-get treasury-balance) claim-amount) (err ERR-INSUFFICIENT-PAYMENT))
+
+            ;; Transfer payment to claimant
+            (try! (as-contract (stx-transfer? claim-amount tx-sender (get claimant claim))))
+
+            ;; Update treasury and statistics
+            (var-set treasury-balance (- (var-get treasury-balance) claim-amount))
+            (var-set total-claims-paid (+ (var-get total-claims-paid) claim-amount))
+
+            ;; Update claim status
+            (map-set claims
+              { claim-id: claim-id }
+              (merge claim {
+                claim-status: CLAIM-STATUS-PAID,
+                processed-block: (some block-height),
+                paid-block: (some block-height)
+              })
+            )
+
+            ;; Update policy status
+            (map-set policies
+              { policy-id: policy-id }
+              (merge policy {
+                policy-status: POLICY-STATUS-CLAIMED,
+                last-updated: block-height
+              })
+            )
+
+            (ok true)
+          )
+        )
+        ;; Reject claim
+        (begin
+          (map-set claims
+            { claim-id: claim-id }
+            (merge claim {
+              claim-status: CLAIM-STATUS-REJECTED,
+              processed-block: (some block-height)
+            })
+          )
+          (ok false)
+        )
+      )
+    )
+  )
+)
+
+;; =============================================================================
+;; PUBLIC FUNCTIONS - Policy Management
+;; =============================================================================
+
+;; Renew an existing policy
+(define-public (renew-policy
+  (policy-id uint)
+  (duration-blocks uint)
+)
+  (let
+    (
+      (policy (unwrap! (get-policy policy-id) (err ERR-POLICY-NOT-FOUND)))
+      (risk-profile (unwrap! (get-risk-profile (get risk-profile-id policy)) (err ERR-INVALID-RISK-PROFILE)))
+    )
+
+    ;; Verify caller is the policyholder
+    (asserts! (is-eq tx-sender (get policyholder policy)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Verify policy is expired or about to expire (within 100 blocks)
+    (asserts! (or
+                (is-eq (get policy-status policy) POLICY-STATUS-EXPIRED)
+                (<= (get end-block policy) (+ block-height u100))
+              )
+              (err ERR-POLICY-NOT-EXPIRED))
+
+    ;; Calculate renewal premium
+    (let
+      (
+        (coverage-amount (get coverage-amount policy))
+        (location (get location policy))
+        (premium-result (unwrap! (calculate-premium (get risk-profile-id policy) coverage-amount location) (err ERR-INVALID-PARAMETERS)))
+      )
+
+      ;; Collect premium payment
+      (try! (stx-transfer? premium-result tx-sender (as-contract tx-sender)))
+
+      ;; Update treasury
+      (var-set treasury-balance (+ (var-get treasury-balance) premium-result))
+      (var-set total-premiums-collected (+ (var-get total-premiums-collected) premium-result))
+
+      ;; Update policy
+      (map-set policies
+        { policy-id: policy-id }
+        (merge policy {
+          start-block: block-height,
+          end-block: (+ block-height duration-blocks),
+          policy-status: POLICY-STATUS-ACTIVE,
+          renewal-count: (+ (get renewal-count policy) u1),
+          last-updated: block-height
+        })
+      )
+
+      (ok true)
+    )
+  )
+)
+
+;; Cancel a policy (with partial refund if applicable)
+(define-public (cancel-policy (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (get-policy policy-id) (err ERR-POLICY-NOT-FOUND)))
+    )
+
+    ;; Verify caller is the policyholder
+    (asserts! (is-eq tx-sender (get policyholder policy)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Verify policy is active
+    (asserts! (is-eq (get policy-status policy) POLICY-STATUS-ACTIVE) (err ERR-POLICY-NOT-ACTIVE))
+
+    ;; Calculate refund (50% if more than half the policy period remains)
+    (let
+      (
+        (start-block (get start-block policy))
+        (end-block (get end-block policy))
+        (total-duration (- end-block start-block))
+        (remaining-duration (- end-block block-height))
+        (premium-amount (get premium-amount policy))
+      )
+
+      (if (> remaining-duration (/ total-duration u2))
+        ;; Refund 50% of premium
+        (let ((refund-amount (/ premium-amount u2)))
+          (asserts! (>= (var-get treasury-balance) refund-amount) (err ERR-INSUFFICIENT-PAYMENT))
+
+          ;; Transfer refund
+          (try! (as-contract (stx-transfer? refund-amount tx-sender (get policyholder policy))))
+
+          ;; Update treasury
+          (var-set treasury-balance (- (var-get treasury-balance) refund-amount))
+
+          ;; Update policy status
+          (map-set policies
+            { policy-id: policy-id }
+            (merge policy {
+              policy-status: POLICY-STATUS-CANCELED,
+              last-updated: block-height
+            })
+          )
+
+          (ok refund-amount)
+        )
+        ;; No refund
+        (begin
+          (map-set policies
+            { policy-id: policy-id }
+            (merge policy {
+              policy-status: POLICY-STATUS-CANCELED,
+              last-updated: block-height
+            })
+          )
+          (ok u0)
+        )
+      )
+    )
+  )
+)
+
+;; =============================================================================
+;; PUBLIC FUNCTIONS - Advanced Oracle Management
+;; =============================================================================
+
+;; Deactivate an oracle (only contract owner)
+(define-public (deactivate-oracle (oracle-id (string-ascii 36)))
+  (let
+    (
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+    )
+
+    ;; Authorization check
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Update oracle status
+    (map-set oracle-registry
+      { oracle-id: oracle-id }
+      (merge oracle { is-active: false })
+    )
+
+    (ok true)
+  )
+)
+
+;; Reactivate an oracle (only contract owner)
+(define-public (reactivate-oracle (oracle-id (string-ascii 36)))
+  (let
+    (
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+    )
+
+    ;; Authorization check
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Update oracle status
+    (map-set oracle-registry
+      { oracle-id: oracle-id }
+      (merge oracle { is-active: true })
+    )
+
+    (ok true)
+  )
+)
+
+;; Update oracle information (only contract owner)
+(define-public (update-oracle-info
+  (oracle-id (string-ascii 36))
+  (new-oracle-name (string-utf8 100))
+  (new-oracle-type uint)
+)
+  (let
+    (
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+    )
+
+    ;; Authorization check
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Update oracle information
+    (map-set oracle-registry
+      { oracle-id: oracle-id }
+      (merge oracle {
+        oracle-name: new-oracle-name,
+        oracle-type: new-oracle-type
+      })
+    )
+
+    (ok true)
+  )
+)
+
+;; Transfer oracle ownership (only current oracle principal)
+(define-public (transfer-oracle-ownership
+  (oracle-id (string-ascii 36))
+  (new-principal principal)
+)
+  (let
+    (
+      (oracle (unwrap! (get-oracle oracle-id) (err ERR-ORACLE-NOT-REGISTERED)))
+    )
+
+    ;; Verify caller is current oracle principal
+    (asserts! (is-eq tx-sender (get oracle-principal oracle)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Update oracle principal
+    (map-set oracle-registry
+      { oracle-id: oracle-id }
+      (merge oracle { oracle-principal: new-principal })
+    )
+
+    (ok true)
+  )
+)
+
+;; =============================================================================
+;; READ-ONLY FUNCTIONS - Advanced Queries
+;; =============================================================================
+
+;; Get a user's policy by index
+(define-read-only (get-user-policy (user principal) (index uint))
+  (match (map-get? user-policies { user: user, index: index })
+    policy-entry
+    (get-policy (get policy-id policy-entry))
+    none
+  )
+)
+
+;; Get all active policies count
+(define-read-only (get-active-policies-count)
+  (var-get next-policy-id)
+)
+
+;; Check if a policy has any claims
+(define-read-only (has-policy-claims (policy-id uint))
+  (is-some (map-get? policy-claims { policy-id: policy-id, claim-index: u0 }))
+)
+
+;; Get policy claim by policy ID
+(define-read-only (get-policy-claim (policy-id uint))
+  (match (map-get? policy-claims { policy-id: policy-id, claim-index: u0 })
+    claim-entry
+    (get-claim (get claim-id claim-entry))
+    none
+  )
+)
+
+;; Get contract statistics
+(define-read-only (get-contract-stats)
+  {
+    total-policies: (- (var-get next-policy-id) u1),
+    total-claims: (- (var-get next-claim-id) u1),
+    treasury-balance: (var-get treasury-balance),
+    total-premiums-collected: (var-get total-premiums-collected),
+    total-claims-paid: (var-get total-claims-paid),
+    contract-owner: (var-get contract-owner)
+  }
+)
+
+;; Check if policy is eligible for renewal
+(define-read-only (is-policy-renewable (policy-id uint))
+  (match (get-policy policy-id)
+    policy
+    (and
+      (is-eq (get policy-status policy) POLICY-STATUS-ACTIVE)
+      (<= (get end-block policy) (+ block-height u100))
+    )
+    false
+  )
+)
+
+;; Get policy time remaining (in blocks)
+(define-read-only (get-policy-time-remaining (policy-id uint))
+  (match (get-policy policy-id)
+    policy
+    (if (> (get end-block policy) block-height)
+      (ok (- (get end-block policy) block-height))
+      (ok u0)
+    )
+    (err ERR-POLICY-NOT-FOUND)
+  )
+)
+
+;; Calculate potential claim amount for a policy
+(define-read-only (calculate-potential-claim (policy-id uint))
+  (match (get-policy policy-id)
+    policy
+    (match (get-policy-condition policy-id u0)
+      condition
+      (let
+        (
+          (coverage-amount (get coverage-amount policy))
+          (payout-percentage (get payout-percentage condition))
+        )
+        (ok (/ (* coverage-amount payout-percentage) u10000))
+      )
+      (err ERR-INVALID-PARAMETERS)
+    )
+    (err ERR-POLICY-NOT-FOUND)
+  )
+)
+
+;; =============================================================================
+;; PUBLIC FUNCTIONS - Emergency & Administrative
+;; =============================================================================
+
+;; Pause the contract (only contract owner)
+(define-public (pause-contract)
+  (begin
+    ;; Authorization check
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Set contract to paused
+    (var-set contract-paused true)
+
+    (ok true)
+  )
+)
+
+;; Unpause the contract (only contract owner)
+(define-public (unpause-contract)
+  (begin
+    ;; Authorization check
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Set contract to unpaused
+    (var-set contract-paused false)
+
+    (ok true)
+  )
+)
+
+;; Emergency withdrawal (only contract owner)
+(define-public (emergency-withdraw (amount uint))
+  (begin
+    ;; Authorization check
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Verify sufficient balance
+    (asserts! (<= amount (var-get treasury-balance)) (err ERR-INSUFFICIENT-PAYMENT))
+
+    ;; Transfer funds to contract owner
+    (try! (as-contract (stx-transfer? amount tx-sender (var-get contract-owner))))
+
+    ;; Update treasury balance
+    (var-set treasury-balance (- (var-get treasury-balance) amount))
+
+    (ok amount)
+  )
+)
+
+;; Transfer contract ownership (only current owner)
+(define-public (transfer-ownership (new-owner principal))
+  (begin
+    ;; Authorization check
+    (asserts! (is-eq tx-sender (var-get contract-owner)) (err ERR-NOT-AUTHORIZED))
+
+    ;; Transfer ownership
+    (var-set contract-owner new-owner)
+
+    (ok true)
+  )
+)
+
+;; Check if contract is paused
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+;; Get contract owner
+(define-read-only (get-contract-owner)
+  (var-get contract-owner)
+)
